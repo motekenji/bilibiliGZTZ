@@ -5,7 +5,8 @@ const path = require('path');
 
 // 配置参数
 const config = {
-  BILI_UP_IDS: process.env.BILI_UP_IDS?.split(',').map(uid => uid.trim()).filter(Boolean) || []
+  BILI_UP_IDS: process.env.BILI_UP_IDS?.split(',').map(uid => uid.trim()).filter(Boolean) || [],
+  BILI_COOKIE: process.env.BILI_COOKIE || ''
 };
 
 // 持久化存储
@@ -15,7 +16,7 @@ let latestData = loadData();
 // 调试模式
 const DEBUG_MODE = process.env.DEBUG === 'true';
 
-// 混淆表（需定期检查有效性）
+// 混淆表（2024-07最新）
 const MIXIN_KEY_ENC_TAB = [
   46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,
   27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,
@@ -28,6 +29,7 @@ function loadData() {
   try {
     return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')) || {};
   } catch (e) {
+    if(DEBUG_MODE) console.log('[DEBUG] 初始化存储文件');
     return {};
   }
 }
@@ -35,16 +37,21 @@ function loadData() {
 // 获取WBI签名密钥
 async function getWbiKeys() {
   try {
+    if(!config.BILI_COOKIE){
+      throw new Error('未配置BILI_COOKIE环境变量');
+    }
+
     const response = await axios.get('https://api.bilibili.com/x/web-interface/nav', {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-        'Referer': 'https://www.bilibili.com/'
+        'Referer': 'https://www.bilibili.com/',
+        'Cookie': config.BILI_COOKIE
       },
       timeout: 10000
     });
 
     if (response.data.code !== 0) {
-      throw new Error(`导航接口错误: ${response.data.message}`);
+      throw new Error(`导航接口错误: ${response.data.message} (code: ${response.data.code})`);
     }
 
     const wbiImg = response.data?.data?.wbi_img;
@@ -53,15 +60,16 @@ async function getWbiKeys() {
     }
 
     return {
-      imgKey: wbiImg.img_key,
-      subKey: wbiImg.sub_key
+      imgKey: wbiImg.img_key.slice(-32), // 兼容性处理
+      subKey: wbiImg.sub_key.slice(-32)
     };
   } catch (e) {
     console.error('[ERROR] 获取签名密钥失败:', e.message);
-    if (DEBUG_MODE && e.response) {
-      console.error('[DEBUG] 错误响应:', e.response.data);
+    if (DEBUG_MODE) {
+      if(e.response) console.error('[DEBUG] 响应数据:', e.response.data);
+      console.error('[DEBUG] 当前Cookie:', config.BILI_COOKIE ? '已配置' : '未配置');
     }
-    throw new Error('请检查网络或更新User-Agent');
+    throw e;
   }
 }
 
@@ -82,7 +90,6 @@ function generateSignedParams(params, imgKey, subKey) {
   try {
     const mixinKey = generateMixinKey(imgKey, subKey);
     
-    // 参数排序（不进行编码）
     const sortedParams = Object.keys(params)
       .sort()
       .reduce((acc, key) => {
@@ -131,13 +138,14 @@ async function getLatestVideo(uid) {
         params: signedParams,
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-          'Referer': `https://space.bilibili.com/${uid}/video`
+          'Referer': `https://space.bilibili.com/${uid}/video`,
+          'Cookie': config.BILI_COOKIE
         },
         timeout: 15000
       });
 
       if (response.data.code !== 0) {
-        throw new Error(`接口错误: ${response.data.message}`);
+        throw new Error(`接口错误: ${response.data.message} (code: ${response.data.code})`);
       }
 
       const videoData = response.data?.data?.list?.vlist?.[0];
@@ -153,21 +161,18 @@ async function getLatestVideo(uid) {
         console.error(`[DEBUG] 第${retry + 1}次重试错误:`, e.message);
         if (e.response) console.error('[DEBUG] 响应数据:', e.response.data);
       }
-      if (retry === 2) throw new Error(`请求失败: ${e.message}`);
+      if (retry === 2) throw e;
       await new Promise(resolve => setTimeout(resolve, 2000 * (retry + 1)));
     }
   }
 }
 
-// 发送通知（需根据青龙环境扩展）
+// 发送通知
 function sendNotify(video) {
-  console.log(`[BiliNotify] UP主 ${video.author} 发布新视频`);
-  console.log(`标题：${video.title}`);
-  console.log(`链接：https://www.bilibili.com/video/${video.bvid}`);
-  console.log();
-  
-  // 此处可添加青龙通知函数，例如：
-  // notify.send(`B站新视频通知`, `${video.author} 发布了新视频：${video.title}`);
+  console.log(`\n[BiliNotify] UP主 ${video.author} 发布新视频`);
+  console.log(`📺 标题：${video.title}`);
+  console.log(`🔗 链接：https://www.bilibili.com/video/${video.bvid}`);
+  console.log('─'.repeat(50));
 }
 
 // 主检测逻辑
@@ -177,11 +182,17 @@ async function checkUpdate() {
     return;
   }
 
+  if (!config.BILI_COOKIE) {
+    console.log('[WARN] 请设置BILI_COOKIE环境变量');
+    return;
+  }
+
   try {
     let hasUpdate = false;
     
     for (const uid of config.BILI_UP_IDS) {
       try {
+        console.log(`[INFO] 正在检查 UP: ${uid}`);
         const video = await getLatestVideo(uid);
         
         if (!latestData[uid]) {
@@ -196,6 +207,8 @@ async function checkUpdate() {
           sendNotify(video);
           latestData[uid] = video.bvid;
           hasUpdate = true;
+        } else {
+          console.log(`[INFO] UP${uid} 暂无更新`);
         }
       } catch (e) {
         console.error(`[ERROR] 监测 UP${uid} 失败: ${e.message}`);
