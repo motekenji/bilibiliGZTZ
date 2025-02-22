@@ -5,7 +5,7 @@ const path = require('path');
 
 // 配置参数
 const config = {
-  BILI_UP_IDS: process.env.BILI_UP_IDS?.split(',').filter(Boolean) || []
+  BILI_UP_IDS: process.env.BILI_UP_IDS?.split(',').map(uid => uid.trim()).filter(Boolean) || []
 };
 
 // 持久化存储
@@ -15,7 +15,7 @@ let latestData = loadData();
 // 调试模式
 const DEBUG_MODE = process.env.DEBUG === 'true';
 
-// 混淆表（官方最新）
+// 混淆表（需定期检查有效性）
 const MIXIN_KEY_ENC_TAB = [
   46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,
   27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,
@@ -32,19 +32,19 @@ function loadData() {
   }
 }
 
-// 获取WBI签名密钥（2024最新方法）
+// 获取WBI签名密钥
 async function getWbiKeys() {
   try {
     const response = await axios.get('https://api.bilibili.com/x/web-interface/nav', {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         'Referer': 'https://www.bilibili.com/'
       },
       timeout: 10000
     });
 
-    if (DEBUG_MODE) {
-      console.log('[DEBUG] 密钥响应:', JSON.stringify(response.data));
+    if (response.data.code !== 0) {
+      throw new Error(`导航接口错误: ${response.data.message}`);
     }
 
     const wbiImg = response.data?.data?.wbi_img;
@@ -58,13 +58,19 @@ async function getWbiKeys() {
     };
   } catch (e) {
     console.error('[ERROR] 获取签名密钥失败:', e.message);
-    throw new Error('请检查网络连接或更新User-Agent');
+    if (DEBUG_MODE && e.response) {
+      console.error('[DEBUG] 错误响应:', e.response.data);
+    }
+    throw new Error('请检查网络或更新User-Agent');
   }
 }
 
-// 生成混合密钥（官方最新算法）
+// 生成混合密钥
 function generateMixinKey(imgKey, subKey) {
   const mixinKey = [...imgKey, ...subKey];
+  if (mixinKey.length < 64) {
+    throw new Error('无效的密钥长度');
+  }
   return MIXIN_KEY_ENC_TAB
     .map(pos => mixinKey[pos])
     .slice(0, 32)
@@ -76,13 +82,11 @@ function generateSignedParams(params, imgKey, subKey) {
   try {
     const mixinKey = generateMixinKey(imgKey, subKey);
     
-    // 参数严格编码
+    // 参数排序（不进行编码）
     const sortedParams = Object.keys(params)
       .sort()
       .reduce((acc, key) => {
-        acc[key] = encodeURIComponent(params[key])
-          .replace(/%20/g, '+')
-          .replace(/'/g, '%27');
+        acc[key] = params[key];
         return acc;
       }, {});
 
@@ -92,7 +96,7 @@ function generateSignedParams(params, imgKey, subKey) {
       .digest('hex');
 
     return { 
-      ...params,
+      ...sortedParams,
       w_rid: hash
     };
   } catch (e) {
@@ -101,7 +105,7 @@ function generateSignedParams(params, imgKey, subKey) {
   }
 }
 
-// 获取最新视频（带自动重试）
+// 获取最新视频
 async function getLatestVideo(uid) {
   for (let retry = 0; retry < 3; retry++) {
     try {
@@ -113,7 +117,7 @@ async function getLatestVideo(uid) {
         pn: 1,
         order: 'pubdate',
         platform: 'web',
-        web_location: 1550101, // 必须参数
+        web_location: 1550101,
         wts: Math.floor(Date.now() / 1000)
       };
 
@@ -132,8 +136,8 @@ async function getLatestVideo(uid) {
         timeout: 15000
       });
 
-      if (DEBUG_MODE) {
-        console.log('[DEBUG] API响应:', JSON.stringify(response.data));
+      if (response.data.code !== 0) {
+        throw new Error(`接口错误: ${response.data.message}`);
       }
 
       const videoData = response.data?.data?.list?.vlist?.[0];
@@ -141,22 +145,29 @@ async function getLatestVideo(uid) {
       
       return {
         bvid: videoData.bvid,
-        title: videoData.title.replace(/<[^>]+>/g, '').trim(), // 清理HTML标签
+        title: videoData.title.replace(/<[^>]+>/g, '').trim(),
         author: videoData.author
       };
     } catch (e) {
+      if (DEBUG_MODE) {
+        console.error(`[DEBUG] 第${retry + 1}次重试错误:`, e.message);
+        if (e.response) console.error('[DEBUG] 响应数据:', e.response.data);
+      }
       if (retry === 2) throw new Error(`请求失败: ${e.message}`);
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      await new Promise(resolve => setTimeout(resolve, 2000 * (retry + 1)));
     }
   }
 }
 
-// 发送通知
+// 发送通知（需根据青龙环境扩展）
 function sendNotify(video) {
   console.log(`[BiliNotify] UP主 ${video.author} 发布新视频`);
   console.log(`标题：${video.title}`);
   console.log(`链接：https://www.bilibili.com/video/${video.bvid}`);
   console.log();
+  
+  // 此处可添加青龙通知函数，例如：
+  // notify.send(`B站新视频通知`, `${video.author} 发布了新视频：${video.title}`);
 }
 
 // 主检测逻辑
@@ -167,28 +178,36 @@ async function checkUpdate() {
   }
 
   try {
+    let hasUpdate = false;
+    
     for (const uid of config.BILI_UP_IDS) {
       try {
         const video = await getLatestVideo(uid);
         
         if (!latestData[uid]) {
-          console.log(`[INFO] 首次监测UP主 ${uid}，当前视频：${video.bvid}`);
+          console.log(`[INIT] 初始化监测 UP${uid}，当前视频：${video.bvid}`);
           latestData[uid] = video.bvid;
+          hasUpdate = true;
           continue;
         }
 
         if (latestData[uid] !== video.bvid) {
+          console.log(`[UPDATE] 检测到 UP${uid} 的新视频 ${video.bvid}`);
           sendNotify(video);
           latestData[uid] = video.bvid;
+          hasUpdate = true;
         }
       } catch (e) {
-        console.error(`[ERROR] 监测UP主 ${uid} 失败: ${e.message}`);
+        console.error(`[ERROR] 监测 UP${uid} 失败: ${e.message}`);
       }
     }
     
-    fs.writeFileSync(DATA_FILE, JSON.stringify(latestData));
+    if (hasUpdate) {
+      fs.writeFileSync(DATA_FILE, JSON.stringify(latestData));
+      console.log('[INFO] 数据已保存');
+    }
   } catch (e) {
-    console.error('[ERROR] 全局检测失败:', e.message);
+    console.error('[FATAL] 全局检测失败:', e.message);
   }
 }
 
