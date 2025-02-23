@@ -42,7 +42,7 @@ class BilibiliMonitor:
     def __init__(self):
         logger.info("初始化B站监控程序...")
         self.api_url = "https://api.bilibili.com/x/space/wbi/arc/search"
-        self.data_file = "video_history.json"
+        self.data_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'video_history.json')
         self.up_uids = os.environ.get("BILIBILI_UP_UIDS", "").split(",")
         
         if not self.up_uids or not self.up_uids[0]:
@@ -51,12 +51,117 @@ class BilibiliMonitor:
         
         logger.info(f"监控的UP主UID列表: {self.up_uids}")
         
-        # ... 其他初始化代码保持不变 ...
+        self.user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        ]
+        self.proxy = os.environ.get("BILIBILI_PROXY", None)
+        self.max_retries = 3
+        self.retry_delay = 5
+        self.request_delay = 5
+
+    def get_random_headers(self):
+        """获取随机User-Agent"""
+        return {
+            "User-Agent": random.choice(self.user_agents),
+            "Referer": "https://space.bilibili.com",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Origin": "https://space.bilibili.com",
+            "Connection": "keep-alive",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-site",
+            "Cookie": os.environ.get("BILIBILI_COOKIE", ""),
+        }
+
+    def get_latest_videos(self, uid):
+        """获取UP主最新视频信息"""
+        for retry in range(self.max_retries):
+            try:
+                time.sleep(self.request_delay + random.uniform(2, 5))
+                
+                params = {
+                    "mid": uid,
+                    "ps": 5,
+                    "tid": 0,
+                    "pn": 1,
+                    "keyword": "",
+                    "order": "pubdate",
+                    "platform": "web",
+                    "web_location": "1550101",
+                    "order_avoided": "true",
+                    "w_rid": "".join(random.choices("0123456789abcdef", k=16)),
+                    "wts": int(time.time()),
+                }
+                
+                proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
+                
+                response = requests.get(
+                    self.api_url,
+                    params=params,
+                    headers=self.get_random_headers(),
+                    proxies=proxies,
+                    timeout=15
+                )
+                
+                logger.info(f"请求URL: {response.url}")
+                logger.info(f"状态码: {response.status_code}")
+                
+                response.raise_for_status()
+                data = response.json()
+                
+                if data["code"] == 0:
+                    return data["data"]["list"]["vlist"]
+                elif data["code"] == -412:
+                    logger.warning(f"请求被拦截，等待重试 ({retry + 1}/{self.max_retries})")
+                    time.sleep(self.retry_delay * (retry + 1))
+                    continue
+                else:
+                    logger.error(f"获取视频信息失败: {data.get('message', '未知错误')}")
+                    return []
+                    
+            except Exception as e:
+                logger.error(f"请求API出错: {str(e)}")
+                if retry < self.max_retries - 1:
+                    time.sleep(self.retry_delay * (retry + 1))
+                    continue
+                return []
+            
+        logger.error(f"获取UP主 {uid} 的视频信息失败，已达到最大重试次数")
+        return []
+
+    def load_history(self):
+        """加载历史记录"""
+        try:
+            if os.path.exists(self.data_file):
+                logger.info(f"从文件加载历史记录: {self.data_file}")
+                with open(self.data_file, 'r', encoding='utf-8') as f:
+                    history = json.load(f)
+                logger.info(f"成功加载历史记录，包含 {len(history)} 个UP主的信息")
+                return history
+            else:
+                logger.info("历史记录文件不存在，创建新的历史记录")
+                return {}
+        except Exception as e:
+            logger.error(f"加载历史记录失败: {str(e)}")
+            return {}
+
+    def save_history(self, history):
+        """保存历史记录"""
+        try:
+            logger.info(f"保存历史记录到文件: {self.data_file}")
+            os.makedirs(os.path.dirname(self.data_file), exist_ok=True)
+            with open(self.data_file, 'w', encoding='utf-8') as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
+            logger.info("历史记录保存成功")
+        except Exception as e:
+            logger.error(f"保存历史记录失败: {str(e)}")
 
     def send_notification(self, title, content):
         """发送通知"""
         try:
-            # 记录通知内容到日志
             logger.info(f"准备发送通知:\n标题: {title}\n内容: {content}")
             
             if os.environ.get('QL_DIR'):
@@ -66,7 +171,6 @@ class BilibiliMonitor:
                     logger.info("青龙面板通知发送成功")
                 except Exception as e:
                     logger.error(f"青龙面板通知发送失败: {str(e)}")
-                    # 尝试备用通知方式
                     self.send_backup_notification(title, content)
             else:
                 logger.info("非青龙环境，直接打印通知信息")
@@ -77,10 +181,8 @@ class BilibiliMonitor:
     def send_backup_notification(self, title, content):
         """备用通知方式"""
         try:
-            # 获取备用通知配置
             push_plus_token = os.environ.get('PUSH_PLUS_TOKEN')
             if push_plus_token:
-                # 使用PushPlus发送通知
                 push_url = "http://www.pushplus.plus/send"
                 data = {
                     "token": push_plus_token,
